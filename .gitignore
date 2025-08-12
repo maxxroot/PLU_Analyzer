@@ -1,0 +1,10 @@
+.env
+*.env
+.env.*
+.venv/
+*.sqlite
+node_modules/
+dist/
+.dockerignore
+package-lock.json
+RoadMap.md

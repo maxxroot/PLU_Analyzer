@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PLU Analyzer - Analyseur automatique de règles d'urbanisme</title>
+    <meta name="description" content="Analysez automatiquement les règles PLU applicables à votre parcelle à partir d'une adresse ou de références cadastrales" />
+    <meta name="keywords" content="PLU, urbanisme, cadastre, analyse automatique, réglementation" />
+    
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://plu-analyzer.com/" />
+    <meta property="og:title" content="PLU Analyzer - Analyseur automatique de règles d'urbanisme" />
+    <meta property="og:description" content="Analysez automatiquement les règles PLU applicables à votre parcelle" />
+    
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image" />
+    <meta property="twitter:url" content="https://plu-analyzer.com/" />
+    <meta property="twitter:title" content="PLU Analyzer" />
+    <meta property="twitter:description" content="Analyseur automatique de règles d'urbanisme" />
+    
+    <!-- Preconnect pour optimiser les performances -->
+    <link rel="preconnect" href="https://api-adresse.data.gouv.fr" />
+    <link rel="preconnect" href="https://apicarto.ign.fr" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
