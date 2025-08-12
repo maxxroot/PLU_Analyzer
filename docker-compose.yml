@@ -1,6 +1,7 @@
 version: '3.8'
 
 services:
+  # Application principale PLU Analyzer
   plu-api:
     build: .
     ports:
@@ -9,6 +10,17 @@ services:
       - NODE_ENV=production
       - PORT=3000
       - FRONTEND_URL=http://localhost:3001
+      - REDIS_URL=redis://redis:6379
+      - OLLAMA_URL=http://ollama:11434
+      - PDF_EXTRACTION_MODE=hybrid  # traditional|ai|hybrid
+      - CACHE_TTL_SECONDS=2592000   # 30 jours
+      - MAX_PDF_SIZE_MB=50
+      - EXTRACTION_TIMEOUT_MS=60000
+    volumes:
+      - pdf_cache:/app/cache
+    depends_on:
+      - redis
+      - ollama
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
@@ -17,16 +29,49 @@ services:
       retries: 3
       start_period: 40s
 
-  # Redis pour le cache (optionnel)
+  # Cache Redis pour les analyses PLU
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-    restart: unless-stopped
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --appendonly yes
     volumes:
       - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
-  # Nginx reverse proxy (optionnel)
+  # Ollama pour l'IA locale (fallback)
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_ORIGINS=http://localhost:3000,http://plu-api:3000
+    restart: unless-stopped
+    # Commande pour initialiser automatiquement le modèle
+    command: >
+      bash -c "
+        ollama serve &
+        sleep 15 &&
+        ollama pull llama3.2:3b &&
+        echo 'Modèle llama3.2:3b téléchargé avec succès' &&
+        wait
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # Nginx reverse proxy (optionnel pour production)
   nginx:
     image: nginx:alpine
     ports:
@@ -38,6 +83,37 @@ services:
     depends_on:
       - plu-api
     restart: unless-stopped
+    profiles:
+      - production  # Démarrer uniquement avec --profile production
+
+  # Service de monitoring (optionnel)
+  monitoring:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    restart: unless-stopped
+    profiles:
+      - monitoring
 
 volumes:
   redis_data:
+    driver: local
+  ollama_data:
+    driver: local
+  pdf_cache:
+    driver: local
+  prometheus_data:
+    driver: local
+
+networks:
+  default:
+    name: plu_network
+    driver: bridge

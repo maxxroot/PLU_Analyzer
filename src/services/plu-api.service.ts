@@ -7,6 +7,43 @@ import {
   PLUAnalysisResult 
 } from '../types/plu.types';
 
+// Import conditionnel du service d'extraction PDF
+let pluExtractorService: any = null;
+try {
+  const extractorModule = require('./pdf-extractor/plu-extractor.service');
+  pluExtractorService = extractorModule.pluExtractorService;
+} catch (error) {
+  console.warn('Service d\'extraction PDF non disponible:', error);
+}
+
+// Type pour l'analyse détaillée (défini ici pour éviter les dépendances)
+interface DetailedPLUAnalysis {
+  zone: string;
+  hauteurMaximale: number | null;
+  nombreEtagesMax: number | null;
+  empriseAuSolMax: number | null;
+  reculVoirie: number | null;
+  reculLimitesSeparatives: number | null;
+  stationnementHabitation: number | null;
+  stationnementBureaux: number | null;
+  stationnementCommerce: number | null;
+  usagesAutorises: string[];
+  usagesInterdits: string[];
+  usagesConditionnes: string[];
+  materiaux: string[];
+  couleurs: string[];
+  toitures: string[];
+  ouvertures: string[];
+  plantationsObligatoires: string[];
+  essencesVegetales: string[];
+  espacesLibresMin: number | null;
+  confidence: number;
+  sourceArticles: string[];
+  lastUpdated: string;
+  restrictions: string[];
+  rights: string[];
+}
+
 export class PLUApiService {
   private readonly BAN_URL = "https://api-adresse.data.gouv.fr/search/";
   private readonly CADASTRE_PARCEL_URL = "https://apicarto.ign.fr/api/cadastre/parcelle";
@@ -14,6 +51,266 @@ export class PLUApiService {
   private readonly GPU_SUP_S = "https://apicarto.ign.fr/api/gpu/assiette-sup-s";
   private readonly GPU_SUP_L = "https://apicarto.ign.fr/api/gpu/assiette-sup-l";
   private readonly GPU_SUP_P = "https://apicarto.ign.fr/api/gpu/assiette-sup-p";
+
+  /**
+   * NOUVELLE MÉTHODE: Analyse enrichie avec extraction PDF automatique
+   */
+  async analyzeByAddressWithPDFExtraction(address: string, options: {
+    extractFromPDF?: boolean;
+    useAI?: boolean;
+    forceRefresh?: boolean;
+  } = {}): Promise<PLUAnalysisResult & { pdfAnalysis?: DetailedPLUAnalysis }> {
+    console.log(`🚀 Analyse enrichie pour: ${address}`);
+    
+    try {
+      // 1. Analyse standard existante
+      const standardAnalysis = await this.analyzeByAddress(address);
+      
+      // 2. Tentative d'extraction PDF si disponible et demandée
+      let pdfAnalysis: DetailedPLUAnalysis | undefined;
+      
+      if (options.extractFromPDF !== false && standardAnalysis.zone.urlfic && pluExtractorService) {
+        try {
+          console.log(`📄 Extraction PDF depuis: ${standardAnalysis.zone.urlfic}`);
+          
+          pdfAnalysis = await pluExtractorService.extractFromPDF(
+            standardAnalysis.zone.urlfic,
+            this.extractZoneCode(standardAnalysis.zone.libelle),
+            {
+              useAI: options.useAI,
+              forceRefresh: options.forceRefresh
+            }
+          );
+
+          // 3. Enrichissement avec les données PDF
+          if (pdfAnalysis && pdfAnalysis.confidence > 0.5) {
+            standardAnalysis.restrictions = this.mergeRestrictions(
+              standardAnalysis.restrictions,
+              pdfAnalysis.restrictions
+            );
+            
+            standardAnalysis.rights = this.mergeRights(
+              standardAnalysis.rights,
+              pdfAnalysis.rights
+            );
+            
+            // Ajouter les documents PDF
+            standardAnalysis.documents.push({
+              name: `Analyse détaillée zone ${pdfAnalysis.zone}`,
+              url: standardAnalysis.zone.urlfic,
+              type: 'reglement'
+            });
+          }
+          
+          console.log(`✅ Extraction PDF réussie: ${Math.round(pdfAnalysis.confidence * 100)}% confiance`);
+          
+        } catch (pdfError) {
+          console.warn(`⚠️ Extraction PDF échouée:`, pdfError);
+          // Continue avec l'analyse standard seulement
+        }
+      } else if (options.extractFromPDF !== false && !pluExtractorService) {
+        console.warn('⚠️ Service d\'extraction PDF non disponible');
+      }
+
+      return {
+        ...standardAnalysis,
+        pdfAnalysis
+      };
+
+    } catch (error) {
+      console.error(`❌ Erreur analyse enrichie:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * NOUVELLE MÉTHODE: Extraction PDF directe (si service disponible)
+   */
+  async extractPLUFromPDF(pdfUrl: string, zone: string, options: {
+    useAI?: boolean;
+    forceRefresh?: boolean;
+    timeout?: number;
+  } = {}): Promise<DetailedPLUAnalysis> {
+    if (!pluExtractorService) {
+      throw new Error('Service d\'extraction PDF non disponible. Installez les dépendances PDF.');
+    }
+
+    console.log(`📄 Extraction PDF directe: ${zone} depuis ${pdfUrl}`);
+    
+    try {
+      return await pluExtractorService.extractFromPDF(pdfUrl, zone, {
+        useAI: options.useAI ?? true,
+        forceRefresh: options.forceRefresh ?? false,
+        timeout: options.timeout ?? 60000
+      });
+    } catch (error) {
+      console.error(`❌ Erreur extraction PDF:`, error);
+      throw new Error(`Impossible d'extraire le PLU: ${error instanceof Error ? error.message : 'Erreur inconnue'}`);
+    }
+  }
+
+  /**
+   * NOUVELLE MÉTHODE: Extraction de toutes les zones d'un PDF
+   */
+  async extractAllZonesFromPDF(pdfUrl: string, options: {
+    useAI?: boolean;
+    forceRefresh?: boolean;
+  } = {}): Promise<DetailedPLUAnalysis[]> {
+    if (!pluExtractorService) {
+      throw new Error('Service d\'extraction PDF non disponible. Installez les dépendances PDF.');
+    }
+
+    console.log(`📄 Extraction complète PDF: ${pdfUrl}`);
+    
+    try {
+      return await pluExtractorService.extractAllZones(pdfUrl, {
+        useAI: options.useAI ?? true,
+        forceRefresh: options.forceRefresh ?? false
+      });
+    } catch (error) {
+      console.error(`❌ Erreur extraction complète:`, error);
+      throw new Error(`Impossible d'extraire toutes les zones: ${error instanceof Error ? error.message : 'Erreur inconnue'}`);
+    }
+  }
+
+  /**
+   * Vérifier si le service PDF est disponible
+   */
+  public isPDFExtractionAvailable(): boolean {
+    return pluExtractorService !== null;
+  }
+
+  /**
+   * Extrait le code de zone depuis le libellé
+   */
+  private extractZoneCode(libelle: string): string {
+    // Extraire le code de zone (ex: "UB" de "UB - Zone urbaine mixte")
+    const match = libelle.match(/^([A-Z]{1,3}\d*[A-Z]*)/);
+    return match ? match[1] : libelle.substring(0, 3);
+  }
+
+  /**
+   * Fusionne les restrictions en évitant les doublons
+   */
+  private mergeRestrictions(standard: string[], pdf: string[]): string[] {
+    const merged = [...standard];
+    
+    for (const pdfRestriction of pdf) {
+      // Vérifier si une restriction similaire existe déjà
+      const exists = merged.some(existing => 
+        this.areSimilarStrings(existing, pdfRestriction)
+      );
+      
+      if (!exists) {
+        merged.push(pdfRestriction);
+      }
+    }
+    
+    return merged;
+  }
+
+  /**
+   * Fusionne les droits en évitant les doublons
+   */
+  private mergeRights(standard: string[], pdf: string[]): string[] {
+    const merged = [...standard];
+    
+    for (const pdfRight of pdf) {
+      const exists = merged.some(existing => 
+        this.areSimilarStrings(existing, pdfRight)
+      );
+      
+      if (!exists) {
+        merged.push(pdfRight);
+      }
+    }
+    
+    return merged;
+  }
+
+  /**
+   * Vérifie si deux chaînes sont similaires (éviter doublons)
+   */
+  private areSimilarStrings(str1: string, str2: string, threshold = 0.8): boolean {
+    const s1 = str1.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const s2 = str2.toLowerCase().replace(/[^a-z0-9]/g, '');
+    
+    if (s1 === s2) return true;
+    
+    // Vérifier si une chaîne contient l'autre
+    if (s1.includes(s2) || s2.includes(s1)) {
+      return s1.length > 0 && s2.length > 0 && 
+             (s1.length / s2.length > threshold || s2.length / s1.length > threshold);
+    }
+    
+    return false;
+  }
+
+  /**
+   * Analyse complète d'une parcelle par adresse
+   * MISE À JOUR: Support extraction PDF optionnelle
+   */
+  async analyzeByAddress(address: string, withPDF = false): Promise<PLUAnalysisResult> {
+    if (withPDF && pluExtractorService) {
+      const enhanced = await this.analyzeByAddressWithPDFExtraction(address, { extractFromPDF: true });
+      // Retirer pdfAnalysis pour compatibilité avec l'interface existante
+      const { pdfAnalysis, ...result } = enhanced;
+      return result;
+    }
+    
+    // Méthode existante conservée pour compatibilité
+    console.log(`🚀 Analyse standard pour: ${address}`);
+    
+    try {
+      // 1. Recherche de l'adresse
+      const addressData = await this.searchAddress(address);
+      
+      // 2. Récupération des données cadastrales
+      const parcelData = await this.getParcelData(addressData.x, addressData.y);
+      
+      // 3. Récupération de la zone d'urbanisme
+      const zoneData = await this.getUrbanZoneData(addressData.x, addressData.y);
+      
+      // 4. Récupération des servitudes
+      const servitudes = await this.getServitudes(addressData.x, addressData.y);
+      
+      // 5. Analyse du règlement (version standard)
+      const analysis = this.analyzeReglement(zoneData);
+      
+      // 6. Compilation des documents
+      const documents = [
+        {
+          name: `Règlement de zone ${zoneData.libelle}`,
+          url: zoneData.urlfic || '',
+          type: 'reglement' as const
+        },
+        {
+          name: 'Plan de zonage',
+          url: '',
+          type: 'zonage' as const
+        }
+      ];
+
+      console.log(`✅ Analyse standard terminée pour: ${addressData.label}`);
+
+      return {
+        address: addressData,
+        parcel: parcelData,
+        zone: zoneData,
+        servitudes,
+        restrictions: analysis.restrictions,
+        rights: analysis.rights,
+        documents
+      };
+    } catch (error) {
+      console.error(`❌ Erreur lors de l'analyse de "${address}":`, error);
+      
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error('Erreur lors de l\'analyse de la parcelle');
+    }
+  }
 
   /**
    * Valide et nettoie une adresse
@@ -101,38 +398,6 @@ export class PLUApiService {
               importance: bestResult.properties.importance,
               x: bestResult.geometry.coordinates[0],
               y: bestResult.geometry.coordinates[1]
-            };
-          }
-        }
-      }
-
-      // Stratégie 3: Recherche par ville uniquement
-      console.log(`🔄 Tentative de recherche par ville uniquement...`);
-      const cityMatch = cleanAddress.match(/\d{5}\s+([^,]+)/);
-      
-      if (cityMatch) {
-        const cityName = cityMatch[1].trim();
-        response = await fetch(`${this.BAN_URL}?q=${encodeURIComponent(cityName)}&type=municipality&limit=1`);
-        
-        if (response.ok) {
-          data = await response.json();
-          
-          if (data.features && data.features.length > 0) {
-            const cityResult = data.features[0];
-            console.log(`✅ Ville trouvée: ${cityResult.properties.label}`);
-            
-            return {
-              label: cityResult.properties.label,
-              score: 0.3, // Score faible car très approximatif
-              housenumber: undefined,
-              street: undefined,
-              postcode: cityResult.properties.postcode,
-              city: cityResult.properties.city,
-              context: cityResult.properties.context,
-              type: 'municipality',
-              importance: cityResult.properties.importance,
-              x: cityResult.geometry.coordinates[0],
-              y: cityResult.geometry.coordinates[1]
             };
           }
         }
@@ -338,7 +603,7 @@ export class PLUApiService {
   }
 
   /**
-   * Analyse le règlement PLU
+   * Analyse le règlement PLU (version standard)
    */
   private analyzeReglement(zoneData: ZoneUrbaData): { restrictions: string[]; rights: string[] } {
     const restrictions: string[] = [];
@@ -429,63 +694,6 @@ export class PLUApiService {
     }
 
     return { restrictions, rights };
-  }
-
-  /**
-   * Analyse complète d'une parcelle par adresse
-   */
-  async analyzeByAddress(address: string): Promise<PLUAnalysisResult> {
-    console.log(`🚀 Début de l'analyse pour: ${address}`);
-    
-    try {
-      // 1. Recherche de l'adresse
-      const addressData = await this.searchAddress(address);
-      
-      // 2. Récupération des données cadastrales
-      const parcelData = await this.getParcelData(addressData.x, addressData.y);
-      
-      // 3. Récupération de la zone d'urbanisme
-      const zoneData = await this.getUrbanZoneData(addressData.x, addressData.y);
-      
-      // 4. Récupération des servitudes
-      const servitudes = await this.getServitudes(addressData.x, addressData.y);
-      
-      // 5. Analyse du règlement
-      const analysis = this.analyzeReglement(zoneData);
-      
-      // 6. Compilation des documents
-      const documents = [
-        {
-          name: `Règlement de zone ${zoneData.libelle}`,
-          url: zoneData.urlfic || '',
-          type: 'reglement' as const
-        },
-        {
-          name: 'Plan de zonage',
-          url: '',
-          type: 'zonage' as const
-        }
-      ];
-
-      console.log(`✅ Analyse terminée avec succès pour: ${addressData.label}`);
-
-      return {
-        address: addressData,
-        parcel: parcelData,
-        zone: zoneData,
-        servitudes,
-        restrictions: analysis.restrictions,
-        rights: analysis.rights,
-        documents
-      };
-    } catch (error) {
-      console.error(`❌ Erreur lors de l'analyse de "${address}":`, error);
-      
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error('Erreur lors de l\'analyse de la parcelle');
-    }
   }
 
   /**
