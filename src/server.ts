@@ -1,4 +1,4 @@
-// src/server.ts
+// src/server.ts - ROUTES MISES À JOUR pour la recherche cadastrale
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
@@ -13,6 +13,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const isDevelopment = process.env.NODE_ENV === 'development';
+
 
 // Middlewares de sécurité (plus permissifs en développement)
 if (!isDevelopment) {
@@ -78,14 +79,526 @@ const validateRequest = (req: Request, res: Response, next: NextFunction) => {
       success: false,
       error: {
         message: 'Données invalides',
-        details: errors.array()
+        type: 'VALIDATION_ERROR',
+        details: errors.array(),
+        suggestions: [
+          'Vérifiez le format des données envoyées',
+          'Consultez la documentation des formats acceptés : /api/cadastre/formats'
+        ]
       }
     });
   }
   next();
 };
 
+/**
+ * Middleware de gestion d'erreurs spécifique cadastre
+ */
+const cadastreErrorHandler = (err: any, req: Request, res: Response, next: NextFunction) => {
+  if (req.path.includes('/cadastre') || req.path.includes('/analyze/cadastre')) {
+    const statusCode = err.statusCode || 422;
+    
+    console.error(`Cadastre Error ${statusCode}:`, err);
+    
+    let errorType = 'CADASTRE_ERROR';
+    let suggestions = [
+      'Vérifiez le format de la référence parcellaire (ex: AB123)',
+      'Vérifiez l\'orthographe du nom de commune',
+      'Vérifiez que le code postal correspond à la commune',
+      'Essayez avec une commune voisine si la parcelle est en limite'
+    ];
+    
+    // Identifier le type d'erreur pour des conseils spécifiques
+    if (err.message?.includes('Format de parcelle')) {
+      errorType = 'INVALID_PARCEL_FORMAT';
+      suggestions = [
+        'Utilisez le format AB1234, 0A1234 ou AB 1234',
+        'Section: 1-3 caractères (lettres/chiffres), doit contenir au moins une lettre',
+        'Numéro: 1-4 chiffres (ex: 1234, 42)',
+        'Sections avec zéro acceptées (0A, 0B, etc.)'
+      ];
+    } else if (err.message?.includes('Commune')) {
+      errorType = 'COMMUNE_ERROR';
+      suggestions = [
+        'Vérifiez l\'orthographe exacte de la commune',
+        'Essayez sans accents ou avec des variantes (Saint/St)',
+        'Vérifiez que le code postal correspond bien à cette commune'
+      ];
+    } else if (err.message?.includes('non trouvée')) {
+      errorType = 'NOT_FOUND';
+      suggestions = [
+        'La parcelle n\'existe peut-être pas dans cette commune',
+        'Vérifiez les données auprès du service cadastre',
+        'Essayez une recherche par adresse si disponible'
+      ];
+    }
+    
+    return res.status(statusCode).json({
+      success: false,
+      error: {
+        message: err.message,
+        type: errorType,
+        suggestions,
+        details: process.env.NODE_ENV === 'development' ? {
+          path: req.path,
+          method: req.method,
+          body: req.body,
+          query: req.query,
+          stack: err.stack
+        } : undefined
+      },
+      timestamp: new Date().toISOString()
+    });
+  }
+  
+  next(err);
+};
+
 // Routes
+
+/**
+ * POST /api/analyze/cadastre - Analyse par référence cadastrale (CORRIGÉE)
+ */
+app.post('/api/analyze/cadastre',
+  [
+    body('codePostal')
+      .isLength({ min: 5, max: 5 })
+      .isNumeric()
+      .withMessage('Code postal français invalide (5 chiffres)'),
+    body('commune')
+      .isString()
+      .isLength({ min: 2, max: 100 })
+      .withMessage('Nom de commune invalide'),
+    body('numeroParcelle')
+      .isString()
+      .isLength({ min: 1, max: 20 })
+      .withMessage('Numéro de parcelle invalide')
+      .matches(/^[A-Z0-9]{1,3}[\s\-_]*\d{1,4}$/i)
+      .withMessage('Format de parcelle invalide (ex: AB1234, 0A1234, AB 1234, AB-1234 - section 1-3 caractères + numéro 1-4 chiffres)')
+      .custom((value) => {
+        // Vérifier qu'il y a au moins une lettre dans la section
+        const clean = value.toUpperCase().replace(/[\s\-_]/g, '');
+        const sectionMatch = clean.match(/^([A-Z0-9]{1,3})/);
+        if (sectionMatch && !/[A-Z]/.test(sectionMatch[1])) {
+          throw new Error('La section doit contenir au moins une lettre');
+        }
+        return true;
+      })
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { codePostal, commune, numeroParcelle } = req.body;
+      
+      console.log(`🗺️ Analyse cadastrale demandée:`);
+      console.log(`   Parcelle: ${numeroParcelle}`);
+      console.log(`   Commune: ${commune}`);
+      console.log(`   Code postal: ${codePostal}`);
+      
+      const startTime = Date.now();
+      
+      // Utiliser la nouvelle méthode corrigée
+      const result = await pluApiService.analyzeByCadastre(codePostal, commune, numeroParcelle);
+      
+      const duration = Date.now() - startTime;
+      
+      console.log(`✅ Analyse cadastrale terminée en ${duration}ms`);
+      
+      res.json({
+        success: true,
+        data: result,
+        metadata: {
+          processingTime: duration,
+          searchMethod: 'cadastre',
+          parcelId: result.parcel.id,
+          zone: result.zone.libelle
+        },
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('❌ Erreur analyse cadastrale:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/cadastre/validate - Validation d'une référence parcellaire
+ */
+app.get('/api/cadastre/validate',
+  [
+    query('codePostal')
+      .isLength({ min: 5, max: 5 })
+      .isNumeric()
+      .withMessage('Code postal invalide'),
+    query('commune')
+      .isString()
+      .isLength({ min: 2, max: 100 })
+      .withMessage('Nom de commune invalide'),
+    query('numeroParcelle')
+      .isString()
+      .isLength({ min: 1, max: 20 })
+      .withMessage('Numéro de parcelle invalide')
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { codePostal, commune, numeroParcelle } = req.query as { 
+        codePostal: string; 
+        commune: string; 
+        numeroParcelle: string; 
+      };
+      
+      console.log(`🔍 Validation parcelle: ${numeroParcelle} à ${commune} (${codePostal})`);
+      
+      const validation = await pluApiService.validateParcelReference(codePostal, commune, numeroParcelle);
+      
+      res.json({
+        success: true,
+        data: {
+          isValid: validation.isValid,
+          parcelle: validation.parcelle ? {
+            id: validation.parcelle.id,
+            commune: validation.parcelle.commune,
+            section: validation.parcelle.section,
+            numero: validation.parcelle.numero,
+            contenance: validation.parcelle.contenance,
+            coordinates: validation.parcelle.centroid
+          } : null,
+          errors: validation.errors || []
+        },
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('❌ Erreur validation cadastrale:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/cadastre/suggest/communes - Suggestions de communes
+ */
+app.get('/api/cadastre/suggest/communes',
+  [
+    query('q')
+      .isString()
+      .isLength({ min: 2, max: 100 })
+      .withMessage('La recherche doit contenir au moins 2 caractères'),
+    query('codePostal')
+      .optional()
+      .isLength({ min: 5, max: 5 })
+      .isNumeric()
+      .withMessage('Code postal invalide si fourni')
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { q, codePostal } = req.query as { q: string; codePostal?: string };
+      
+      console.log(`🔍 Suggestions communes pour: "${q}"${codePostal ? ` (${codePostal})` : ''}`);
+      
+      const suggestions = await pluApiService.suggestCommunes(q, codePostal);
+      
+      res.json({
+        success: true,
+        data: suggestions,
+        count: suggestions.length,
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('❌ Erreur suggestions communes:', error);
+      // Ne pas faire échouer la requête, retourner un tableau vide
+      res.json({
+        success: true,
+        data: [],
+        count: 0,
+        error: 'Impossible de récupérer les suggestions',
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/cadastre/parcelle/info - Informations détaillées d'une parcelle
+ */
+app.get('/api/cadastre/parcelle/info',
+  [
+    query('codePostal').isLength({ min: 5, max: 5 }).isNumeric(),
+    query('commune').isString().isLength({ min: 2, max: 100 }),
+    query('numeroParcelle').isString().isLength({ min: 1, max: 20 })
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { codePostal, commune, numeroParcelle } = req.query as { 
+        codePostal: string; 
+        commune: string; 
+        numeroParcelle: string; 
+      };
+      
+      console.log(`ℹ️ Infos détaillées parcelle: ${numeroParcelle}`);
+      
+      // Réutiliser la validation qui fait déjà la recherche
+      const validation = await pluApiService.validateParcelReference(codePostal, commune, numeroParcelle);
+      
+      if (!validation.isValid || !validation.parcelle) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            message: 'Parcelle non trouvée',
+            details: validation.errors
+          }
+        });
+      }
+      
+      const parcelle = validation.parcelle;
+      
+      // Informations enrichies
+      const detailedInfo = {
+        identification: {
+          id: parcelle.id,
+          commune: parcelle.commune,
+          section: parcelle.section,
+          numero: parcelle.numero,
+          prefixe: parcelle.prefixe,
+          reference: `${parcelle.section}${parcelle.numero}`
+        },
+        geometrie: {
+          contenance: parcelle.contenance,
+          unite: 'm²',
+          centroid: {
+            longitude: parcelle.centroid[0],
+            latitude: parcelle.centroid[1]
+          },
+          geometry: parcelle.geometry
+        },
+        liens: {
+          cadastreGouv: `https://www.cadastre.gouv.fr/scpc/rechparcel.do?file=${parcelle.id}`,
+          geoportail: `https://www.geoportail.gouv.fr/carte?c=${parcelle.centroid[0]},${parcelle.centroid[1]}&z=18&l0=ORTHOIMAGERY.ORTHOPHOTOS::GEOPORTAIL:OGC:WMTS(1)&l1=CADASTRALPARCELS.PARCELLAIRE_EXPRESS::GEOPORTAIL:OGC:WMTS(0.6)&permalink=yes`
+        }
+      };
+      
+      res.json({
+        success: true,
+        data: detailedInfo,
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('❌ Erreur infos parcelle:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/cadastre/test - Test de la recherche cadastrale avec exemples
+ */
+app.get('/api/cadastre/test',
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      console.log(`🧪 Test de la recherche cadastrale`);
+      
+      const testCases = [
+        {
+          name: 'Parcelle urbaine classique',
+          params: { codePostal: '33000', commune: 'Bordeaux', numeroParcelle: 'AB1234' },
+          description: 'Test avec une parcelle classique dans Bordeaux'
+        },
+        {
+          name: 'Parcelle avec section commençant par 0',
+          params: { codePostal: '75001', commune: 'Paris', numeroParcelle: '0A4567' },
+          description: 'Test avec section commençant par zéro'
+        },
+        {
+          name: 'Parcelle avec tiret',
+          params: { codePostal: '69001', commune: 'Lyon', numeroParcelle: 'CD-7890' },
+          description: 'Test avec tiret dans la référence'
+        },
+        {
+          name: 'Parcelle avec numéro court',
+          params: { codePostal: '13001', commune: 'Marseille', numeroParcelle: '0B42' },
+          description: 'Test avec section 0B et numéro qui sera complété (0042)'
+        }
+      ];
+      
+      const results = [];
+      
+      for (const testCase of testCases) {
+        try {
+          console.log(`🔍 Test: ${testCase.name}`);
+          
+          const startTime = Date.now();
+          const validation = await pluApiService.validateParcelReference(
+            testCase.params.codePostal,
+            testCase.params.commune,
+            testCase.params.numeroParcelle
+          );
+          const duration = Date.now() - startTime;
+          
+          results.push({
+            name: testCase.name,
+            params: testCase.params,
+            description: testCase.description,
+            result: {
+              success: validation.isValid,
+              duration: `${duration}ms`,
+              parcelle: validation.parcelle ? {
+                id: validation.parcelle.id,
+                coordinates: validation.parcelle.centroid
+              } : null,
+              errors: validation.errors
+            }
+          });
+          
+          console.log(`${validation.isValid ? '✅' : '❌'} Test ${testCase.name}: ${duration}ms`);
+          
+        } catch (error) {
+          results.push({
+            name: testCase.name,
+            params: testCase.params,
+            description: testCase.description,
+            result: {
+              success: false,
+              error: error instanceof Error ? error.message : 'Erreur inconnue'
+            }
+          });
+          
+          console.log(`❌ Test ${testCase.name} échoué:`, error);
+        }
+      }
+      
+      res.json({
+        success: true,
+        data: {
+          summary: {
+            totalTests: results.length,
+            successfulTests: results.filter(r => r.result.success).length,
+            timestamp: new Date().toISOString()
+          },
+          results
+        },
+        message: 'Tests de recherche cadastrale terminés'
+      });
+      
+    } catch (error) {
+      console.error('❌ Erreur test cadastral:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/cadastre/formats - Documentation des formats acceptés
+ */
+app.get('/api/cadastre/formats', (req: Request, res: Response) => {
+  const documentation = {
+    formats: {
+      parcelle: {
+        description: 'Formats de référence parcellaire acceptés',
+        examples: [
+          'AB1234',
+          '0A1234',
+          'AB 1234',
+          'AB-1234',
+          'AB_1234',
+          'ZE0042',
+          '0B0001'
+        ],
+        rules: [
+          '1 à 3 caractères pour la section (lettres et/ou chiffres)',
+          'La section doit contenir au moins une lettre',
+          'Sections avec zéro acceptées (0A, 0B, etc.)',
+          'Suivi de 1 à 4 chiffres pour le numéro (complété automatiquement à 4 chiffres)',
+          'Espaces, tirets et underscores ignorés',
+          'Casse ignorée (0a1234 = 0A1234)',
+          'Numéros de 1 à 9999 acceptés'
+        ]
+      },
+      commune: {
+        description: 'Formats de nom de commune acceptés',
+        examples: [
+          'Paris',
+          'Saint-Étienne',
+          'Sainte-Marie-de-Ré',
+          'Aix-en-Provence'
+        ],
+        rules: [
+          'Nom complet de la commune',
+          'Accents optionnels',
+          'Tirets conservés',
+          'Casse ignorée'
+        ]
+      },
+      codePostal: {
+        description: 'Code postal français',
+        format: '5 chiffres exactement',
+        examples: ['75001', '33000', '69001'],
+        rules: [
+          'Exactement 5 chiffres',
+          'Pas d\'espaces ou de tirets',
+          'Codes postaux français uniquement'
+        ]
+      }
+    },
+    apis: {
+      validation: {
+        endpoint: '/api/cadastre/validate',
+        method: 'GET',
+        description: 'Valide une référence parcellaire sans faire l\'analyse complète',
+        parameters: ['codePostal', 'commune', 'numeroParcelle']
+      },
+      analyse: {
+        endpoint: '/api/analyze/cadastre',
+        method: 'POST',
+        description: 'Analyse complète PLU d\'une parcelle',
+        body: {
+          codePostal: 'string (5 chiffres)',
+          commune: 'string',
+          numeroParcelle: 'string'
+        }
+      },
+      suggestions: {
+        endpoint: '/api/cadastre/suggest/communes',
+        method: 'GET',
+        description: 'Suggestions de communes pour l\'autocomplétion',
+        parameters: ['q (query)', 'codePostal (optionnel)']
+      }
+    },
+    errors: {
+      common: [
+        {
+          code: 'INVALID_POSTAL_CODE',
+          message: 'Code postal invalide',
+          solution: 'Utiliser 5 chiffres exactement'
+        },
+        {
+          code: 'INVALID_PARCEL_FORMAT',
+          message: 'Format de parcelle invalide',
+          solution: 'Utiliser le format AB1234, 0A1234 ou AB 1234 (section + 4 chiffres)'
+        },
+        {
+          code: 'COMMUNE_NOT_FOUND',
+          message: 'Commune non trouvée',
+          solution: 'Vérifier l\'orthographe et le code postal'
+        },
+        {
+          code: 'PARCEL_NOT_FOUND',
+          message: 'Parcelle non trouvée',
+          solution: 'Vérifier la référence cadastrale'
+        }
+      ]
+    }
+  };
+  
+  res.json({
+    success: true,
+    data: documentation,
+    version: '1.1.0',
+    timestamp: new Date().toISOString()
+  });
+});
 
 /**
  * GET /api/health - Health check
@@ -1129,6 +1642,8 @@ app.use('*', (req: Request, res: Response) => {
 // Middleware de gestion d'erreurs (doit être en dernier)
 app.use(errorHandler);
 app.use(pdfErrorHandler);
+app.use(cadastreErrorHandler);
+
 
 // Démarrage du serveur
 const server = app.listen(PORT, () => {
@@ -1142,6 +1657,8 @@ const server = app.listen(PORT, () => {
     console.log(`⚡ Rate limiting: 1000 req/min (vs 100 en production)`);
   }
 });
+
+
 
 // Gestion gracieuse de l'arrêt
 process.on('SIGTERM', () => {

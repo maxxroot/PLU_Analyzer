@@ -7,6 +7,12 @@ import {
   PLUAnalysisResult 
 } from '../types/plu.types';
 
+import { 
+  CadastreSearchService, 
+  CadastreSearchParams,
+  ParcelleResult 
+} from './cadastre-search.service';
+
 // Import conditionnel du service d'extraction PDF
 let pluExtractorService: any = null;
 try {
@@ -14,34 +20,6 @@ try {
   pluExtractorService = extractorModule.pluExtractorService;
 } catch (error) {
   console.warn('Service d\'extraction PDF non disponible:', error);
-}
-
-// Type pour l'analyse détaillée (défini ici pour éviter les dépendances)
-interface DetailedPLUAnalysis {
-  zone: string;
-  hauteurMaximale: number | null;
-  nombreEtagesMax: number | null;
-  empriseAuSolMax: number | null;
-  reculVoirie: number | null;
-  reculLimitesSeparatives: number | null;
-  stationnementHabitation: number | null;
-  stationnementBureaux: number | null;
-  stationnementCommerce: number | null;
-  usagesAutorises: string[];
-  usagesInterdits: string[];
-  usagesConditionnes: string[];
-  materiaux: string[];
-  couleurs: string[];
-  toitures: string[];
-  ouvertures: string[];
-  plantationsObligatoires: string[];
-  essencesVegetales: string[];
-  espacesLibresMin: number | null;
-  confidence: number;
-  sourceArticles: string[];
-  lastUpdated: string;
-  restrictions: string[];
-  rights: string[];
 }
 
 export class PLUApiService {
@@ -52,14 +30,216 @@ export class PLUApiService {
   private readonly GPU_SUP_L = "https://apicarto.ign.fr/api/gpu/assiette-sup-l";
   private readonly GPU_SUP_P = "https://apicarto.ign.fr/api/gpu/assiette-sup-p";
 
+  private cadastreService: CadastreSearchService;
+
+  constructor() {
+    this.cadastreService = new CadastreSearchService();
+  }
+
   /**
-   * NOUVELLE MÉTHODE: Analyse enrichie avec extraction PDF automatique
+   * NOUVELLE MÉTHODE CORRIGÉE: Analyse par référence cadastrale
+   */
+  async analyzeByCadastre(codePostal: string, commune: string, numeroParcelle: string): Promise<PLUAnalysisResult> {
+    console.log(`🗺️ Analyse par cadastre: ${numeroParcelle} à ${commune} (${codePostal})`);
+    
+    try {
+      // 1. Valider les paramètres
+      const params: CadastreSearchParams = { codePostal, commune, numeroParcelle };
+      const validationErrors = this.cadastreService.validateSearchParams(params);
+      
+      if (validationErrors.length > 0) {
+        throw new Error(`Paramètres invalides: ${validationErrors.join(', ')}`);
+      }
+
+      // 2. Rechercher la parcelle cadastrale
+      const parcelleResult = await this.cadastreService.searchParcelle(params);
+      
+      if (!parcelleResult) {
+        throw new Error(`Parcelle "${numeroParcelle}" non trouvée dans la commune ${commune} (${codePostal})`);
+      }
+
+      // 3. Utiliser les coordonnées de la parcelle pour l'analyse PLU
+      const [longitude, latitude] = parcelleResult.centroid;
+      
+      console.log(`📍 Coordonnées parcelle: ${longitude}, ${latitude}`);
+
+      // 4. Récupérer les données d'urbanisme
+      const zoneData = await this.getUrbanZoneData(longitude, latitude);
+      const servitudes = await this.getServitudes(longitude, latitude);
+
+      // 5. Créer des données d'adresse synthétiques
+      const syntheticAddress: AddressData = {
+        label: `Parcelle ${numeroParcelle}, ${commune} ${codePostal}`,
+        score: 0.95, // Score élevé car recherche directe
+        postcode: codePostal,
+        city: commune,
+        context: `${parcelleResult.commune}, ${this.getDepartmentFromCode(codePostal)}`,
+        type: 'parcel',
+        importance: 0.8,
+        x: longitude,
+        y: latitude
+      };
+
+      // 6. Formater les données de parcelle
+      const parcelData: ParcelData = {
+        id: parcelleResult.id,
+        commune: parcelleResult.commune,
+        prefixe: parcelleResult.prefixe,
+        section: parcelleResult.section,
+        numero: parcelleResult.numero,
+        contenance: parcelleResult.contenance,
+        geometry: parcelleResult.geometry
+      };
+
+      // 7. Analyser le règlement
+      const analysis = this.analyzeReglement(zoneData);
+
+      // 8. Compilation des documents
+      const documents = [
+        {
+          name: `Règlement de zone ${zoneData.libelle}`,
+          url: zoneData.urlfic || '',
+          type: 'reglement' as const
+        },
+        {
+          name: 'Plan de zonage',
+          url: '',
+          type: 'zonage' as const
+        },
+        {
+          name: `Fiche parcellaire ${parcelleResult.id}`,
+          url: `https://www.cadastre.gouv.fr/scpc/rechparcel.do?file=${parcelleResult.id}`,
+          type: 'reglement' as const
+        }
+      ];
+
+      console.log(`✅ Analyse cadastrale terminée pour: ${parcelleResult.id}`);
+
+      return {
+        address: syntheticAddress,
+        parcel: parcelData,
+        zone: zoneData,
+        servitudes,
+        restrictions: analysis.restrictions,
+        rights: analysis.rights,
+        documents
+      };
+
+    } catch (error) {
+      console.error(`❌ Erreur lors de l'analyse cadastrale:`, error);
+      
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error('Erreur lors de l\'analyse par référence cadastrale');
+    }
+  }
+
+  /**
+   * NOUVELLE MÉTHODE: Suggestions de communes pour l'autocomplétion
+   */
+  async suggestCommunes(query: string, codePostal?: string): Promise<Array<{
+    nom: string;
+    code: string;
+    codesPostaux: string[];
+    label: string;
+  }>> {
+    try {
+      const suggestions = await this.cadastreService.suggestCommunes(query, codePostal);
+      
+      return suggestions.map(commune => ({
+        nom: commune.nom,
+        code: commune.code,
+        codesPostaux: commune.codesPostaux,
+        label: `${commune.nom} (${commune.codesPostaux.join(', ')})`
+      }));
+    } catch (error) {
+      console.warn('⚠️ Erreur suggestions communes:', error);
+      return [];
+    }
+  }
+
+  /**
+   * NOUVELLE MÉTHODE: Validation d'une référence parcellaire
+   */
+  async validateParcelReference(codePostal: string, commune: string, numeroParcelle: string): Promise<{
+    isValid: boolean;
+    parcelle?: ParcelleResult;
+    errors?: string[];
+  }> {
+    try {
+      const params: CadastreSearchParams = { codePostal, commune, numeroParcelle };
+      const validationErrors = this.cadastreService.validateSearchParams(params);
+      
+      if (validationErrors.length > 0) {
+        return {
+          isValid: false,
+          errors: validationErrors
+        };
+      }
+
+      const parcelle = await this.cadastreService.searchParcelle(params);
+      
+      return {
+        isValid: !!parcelle,
+        parcelle: parcelle || undefined,
+        errors: parcelle ? [] : [`Parcelle "${numeroParcelle}" non trouvée`]
+      };
+
+    } catch (error) {
+      return {
+        isValid: false,
+        errors: [error instanceof Error ? error.message : 'Erreur de validation']
+      };
+    }
+  }
+
+  /**
+   * Méthode utilitaire pour obtenir le département depuis le code postal
+   */
+  private getDepartmentFromCode(codePostal: string): string {
+    const departmentCode = codePostal.substring(0, 2);
+    
+    const departments: { [key: string]: string } = {
+      '01': 'Ain', '02': 'Aisne', '03': 'Allier', '04': 'Alpes-de-Haute-Provence',
+      '05': 'Hautes-Alpes', '06': 'Alpes-Maritimes', '07': 'Ardèche', '08': 'Ardennes',
+      '09': 'Ariège', '10': 'Aube', '11': 'Aude', '12': 'Aveyron',
+      '13': 'Bouches-du-Rhône', '14': 'Calvados', '15': 'Cantal', '16': 'Charente',
+      '17': 'Charente-Maritime', '18': 'Cher', '19': 'Corrèze', '20': 'Corse',
+      '21': 'Côte-d\'Or', '22': 'Côtes-d\'Armor', '23': 'Creuse', '24': 'Dordogne',
+      '25': 'Doubs', '26': 'Drôme', '27': 'Eure', '28': 'Eure-et-Loir',
+      '29': 'Finistère', '30': 'Gard', '31': 'Haute-Garonne', '32': 'Gers',
+      '33': 'Gironde', '34': 'Hérault', '35': 'Ille-et-Vilaine', '36': 'Indre',
+      '37': 'Indre-et-Loire', '38': 'Isère', '39': 'Jura', '40': 'Landes',
+      '41': 'Loir-et-Cher', '42': 'Loire', '43': 'Haute-Loire', '44': 'Loire-Atlantique',
+      '45': 'Loiret', '46': 'Lot', '47': 'Lot-et-Garonne', '48': 'Lozère',
+      '49': 'Maine-et-Loire', '50': 'Manche', '51': 'Marne', '52': 'Haute-Marne',
+      '53': 'Mayenne', '54': 'Meurthe-et-Moselle', '55': 'Meuse', '56': 'Morbihan',
+      '57': 'Moselle', '58': 'Nièvre', '59': 'Nord', '60': 'Oise',
+      '61': 'Orne', '62': 'Pas-de-Calais', '63': 'Puy-de-Dôme', '64': 'Pyrénées-Atlantiques',
+      '65': 'Hautes-Pyrénées', '66': 'Pyrénées-Orientales', '67': 'Bas-Rhin', '68': 'Haut-Rhin',
+      '69': 'Rhône', '70': 'Haute-Saône', '71': 'Saône-et-Loire', '72': 'Sarthe',
+      '73': 'Savoie', '74': 'Haute-Savoie', '75': 'Paris', '76': 'Seine-Maritime',
+      '77': 'Seine-et-Marne', '78': 'Yvelines', '79': 'Deux-Sèvres', '80': 'Somme',
+      '81': 'Tarn', '82': 'Tarn-et-Garonne', '83': 'Var', '84': 'Vaucluse',
+      '85': 'Vendée', '86': 'Vienne', '87': 'Haute-Vienne', '88': 'Vosges',
+      '89': 'Yonne', '90': 'Territoire de Belfort', '91': 'Essonne', '92': 'Hauts-de-Seine',
+      '93': 'Seine-Saint-Denis', '94': 'Val-de-Marne', '95': 'Val-d\'Oise'
+    };
+    
+    return departments[departmentCode] || `Département ${departmentCode}`;
+  }
+
+  // ... [Conserver toutes les autres méthodes existantes] ...
+
+  /**
+   * MÉTHODE MISE À JOUR: Analyse enrichie avec extraction PDF automatique
    */
   async analyzeByAddressWithPDFExtraction(address: string, options: {
     extractFromPDF?: boolean;
     useAI?: boolean;
     forceRefresh?: boolean;
-  } = {}): Promise<PLUAnalysisResult & { pdfAnalysis?: DetailedPLUAnalysis }> {
+  } = {}): Promise<PLUAnalysisResult & { pdfAnalysis?: any }> {
     console.log(`🚀 Analyse enrichie pour: ${address}`);
     
     try {
@@ -67,7 +247,7 @@ export class PLUApiService {
       const standardAnalysis = await this.analyzeByAddress(address);
       
       // 2. Tentative d'extraction PDF si disponible et demandée
-      let pdfAnalysis: DetailedPLUAnalysis | undefined;
+      let pdfAnalysis: any;
       
       if (options.extractFromPDF !== false && standardAnalysis.zone.urlfic && pluExtractorService) {
         try {
@@ -121,63 +301,6 @@ export class PLUApiService {
       console.error(`❌ Erreur analyse enrichie:`, error);
       throw error;
     }
-  }
-
-  /**
-   * NOUVELLE MÉTHODE: Extraction PDF directe (si service disponible)
-   */
-  async extractPLUFromPDF(pdfUrl: string, zone: string, options: {
-    useAI?: boolean;
-    forceRefresh?: boolean;
-    timeout?: number;
-  } = {}): Promise<DetailedPLUAnalysis> {
-    if (!pluExtractorService) {
-      throw new Error('Service d\'extraction PDF non disponible. Installez les dépendances PDF.');
-    }
-
-    console.log(`📄 Extraction PDF directe: ${zone} depuis ${pdfUrl}`);
-    
-    try {
-      return await pluExtractorService.extractFromPDF(pdfUrl, zone, {
-        useAI: options.useAI ?? true,
-        forceRefresh: options.forceRefresh ?? false,
-        timeout: options.timeout ?? 60000
-      });
-    } catch (error) {
-      console.error(`❌ Erreur extraction PDF:`, error);
-      throw new Error(`Impossible d'extraire le PLU: ${error instanceof Error ? error.message : 'Erreur inconnue'}`);
-    }
-  }
-
-  /**
-   * NOUVELLE MÉTHODE: Extraction de toutes les zones d'un PDF
-   */
-  async extractAllZonesFromPDF(pdfUrl: string, options: {
-    useAI?: boolean;
-    forceRefresh?: boolean;
-  } = {}): Promise<DetailedPLUAnalysis[]> {
-    if (!pluExtractorService) {
-      throw new Error('Service d\'extraction PDF non disponible. Installez les dépendances PDF.');
-    }
-
-    console.log(`📄 Extraction complète PDF: ${pdfUrl}`);
-    
-    try {
-      return await pluExtractorService.extractAllZones(pdfUrl, {
-        useAI: options.useAI ?? true,
-        forceRefresh: options.forceRefresh ?? false
-      });
-    } catch (error) {
-      console.error(`❌ Erreur extraction complète:`, error);
-      throw new Error(`Impossible d'extraire toutes les zones: ${error instanceof Error ? error.message : 'Erreur inconnue'}`);
-    }
-  }
-
-  /**
-   * Vérifier si le service PDF est disponible
-   */
-  public isPDFExtractionAvailable(): boolean {
-    return pluExtractorService !== null;
   }
 
   /**
@@ -247,8 +370,14 @@ export class PLUApiService {
   }
 
   /**
+   * Vérifier si le service PDF est disponible
+   */
+  public isPDFExtractionAvailable(): boolean {
+    return pluExtractorService !== null;
+  }
+
+  /**
    * Analyse complète d'une parcelle par adresse
-   * MISE À JOUR: Support extraction PDF optionnelle
    */
   async analyzeByAddress(address: string, withPDF = false): Promise<PLUAnalysisResult> {
     if (withPDF && pluExtractorService) {
@@ -697,25 +826,52 @@ export class PLUApiService {
   }
 
   /**
-   * Analyse complète d'une parcelle par référence cadastrale
+   * NOUVELLE MÉTHODE: Extraction PDF directe (si service disponible)
    */
-  async analyzeByCadastre(codePostal: string, commune: string, parcelle: string): Promise<PLUAnalysisResult> {
+  async extractPLUFromPDF(pdfUrl: string, zone: string, options: {
+    useAI?: boolean;
+    forceRefresh?: boolean;
+    timeout?: number;
+  } = {}): Promise<any> {
+    if (!pluExtractorService) {
+      throw new Error('Service d\'extraction PDF non disponible. Installez les dépendances PDF.');
+    }
+
+    console.log(`📄 Extraction PDF directe: ${zone} depuis ${pdfUrl}`);
+    
     try {
-      // Recherche de l'adresse approximative via la commune et le code postal
-      const searchQuery = `${commune} ${codePostal}`;
-      console.log(`🗺️ Recherche par cadastre: ${searchQuery}`);
-      
-      const addressData = await this.searchAddress(searchQuery);
-      
-      // Le reste de l'analyse est similaire
-      return this.analyzeByAddress(addressData.label);
+      return await pluExtractorService.extractFromPDF(pdfUrl, zone, {
+        useAI: options.useAI ?? true,
+        forceRefresh: options.forceRefresh ?? false,
+        timeout: options.timeout ?? 60000
+      });
     } catch (error) {
-      console.error(`❌ Erreur lors de l'analyse par cadastre:`, error);
-      
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error('Erreur lors de l\'analyse par référence cadastrale');
+      console.error(`❌ Erreur extraction PDF:`, error);
+      throw new Error(`Impossible d'extraire le PLU: ${error instanceof Error ? error.message : 'Erreur inconnue'}`);
+    }
+  }
+
+  /**
+   * NOUVELLE MÉTHODE: Extraction de toutes les zones d'un PDF
+   */
+  async extractAllZonesFromPDF(pdfUrl: string, options: {
+    useAI?: boolean;
+    forceRefresh?: boolean;
+  } = {}): Promise<any[]> {
+    if (!pluExtractorService) {
+      throw new Error('Service d\'extraction PDF non disponible. Installez les dépendances PDF.');
+    }
+
+    console.log(`📄 Extraction complète PDF: ${pdfUrl}`);
+    
+    try {
+      return await pluExtractorService.extractAllZones(pdfUrl, {
+        useAI: options.useAI ?? true,
+        forceRefresh: options.forceRefresh ?? false
+      });
+    } catch (error) {
+      console.error(`❌ Erreur extraction complète:`, error);
+      throw new Error(`Impossible d'extraire toutes les zones: ${error instanceof Error ? error.message : 'Erreur inconnue'}`);
     }
   }
 }
