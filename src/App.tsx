@@ -1,5 +1,6 @@
+// src/App.tsx
 import React, { useState, useRef, useEffect } from 'react';
-import { Search, MapPin, FileText, Loader2, AlertCircle, CheckCircle } from 'lucide-react';
+import { Search, MapPin, FileText, Loader2, AlertCircle, CheckCircle, Info } from 'lucide-react';
 
 interface ParcelData {
   address?: string;
@@ -20,6 +21,26 @@ interface AddressSuggestion {
   postcode: string;
 }
 
+interface CommuneSuggestion {
+  nom: string;
+  code: string;
+  codesPostaux: string[];
+  label: string;
+}
+
+interface ValidationResult {
+  isValid: boolean;
+  parcelle?: {
+    id: string;
+    commune: string;
+    section: string;
+    numero: string;
+    contenance: number;
+    coordinates: [number, number];
+  };
+  errors?: string[];
+}
+
 const PLUAnalyzer = () => {
   const [searchType, setSearchType] = useState<'address' | 'cadastre'>('address');
   const [formData, setFormData] = useState({
@@ -32,9 +53,15 @@ const PLUAnalyzer = () => {
   const [result, setResult] = useState<ParcelData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [addressSuggestions, setAddressSuggestions] = useState<AddressSuggestion[]>([]);
-  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [communeSuggestions, setCommuneSuggestions] = useState<CommuneSuggestion[]>([]);
+  const [showAddressSuggestions, setShowAddressSuggestions] = useState(false);
+  const [showCommuneSuggestions, setShowCommuneSuggestions] = useState(false);
   const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
+  const [validatingParcelle, setValidatingParcelle] = useState(false);
+  
   const suggestionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const validationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const handleInputChange = (field: string, value: string) => {
     setFormData(prev => ({
@@ -43,12 +70,16 @@ const PLUAnalyzer = () => {
     }));
     setError(null);
     
+    // Reset des validations quand on modifie les données cadastrales
+    if (['codePostal', 'commune', 'numeroParcelle'].includes(field)) {
+      setValidationResult(null);
+    }
+    
     // Autocomplétion pour les adresses
     if (field === 'address') {
       console.log(`🔍 Saisie d'adresse: "${value}"`);
       
       if (value.length > 3) {
-        // Debouncing : attendre 500ms après la dernière saisie
         if (suggestionTimeoutRef.current) {
           clearTimeout(suggestionTimeoutRef.current);
         }
@@ -58,7 +89,44 @@ const PLUAnalyzer = () => {
         }, 500);
       } else {
         setAddressSuggestions([]);
-        setShowSuggestions(false);
+        setShowAddressSuggestions(false);
+      }
+    }
+    
+    // Autocomplétion pour les communes
+    if (field === 'commune') {
+      console.log(`🔍 Saisie commune: "${value}"`);
+      
+      if (value.length > 2) {
+        if (suggestionTimeoutRef.current) {
+          clearTimeout(suggestionTimeoutRef.current);
+        }
+        
+        suggestionTimeoutRef.current = setTimeout(() => {
+          searchCommuneSuggestions(value, formData.codePostal);
+        }, 500);
+      } else {
+        setCommuneSuggestions([]);
+        setShowCommuneSuggestions(false);
+      }
+    }
+    
+    // Validation automatique de la parcelle
+    if (['codePostal', 'commune', 'numeroParcelle'].includes(field)) {
+      // Valider seulement si tous les champs sont remplis
+      const newFormData = { ...formData, [field]: value };
+      
+      if (newFormData.codePostal.length === 5 && 
+          newFormData.commune.length > 2 && 
+          newFormData.numeroParcelle.length > 0) {
+        
+        if (validationTimeoutRef.current) {
+          clearTimeout(validationTimeoutRef.current);
+        }
+        
+        validationTimeoutRef.current = setTimeout(() => {
+          validateParcelleReference(newFormData.codePostal, newFormData.commune, newFormData.numeroParcelle);
+        }, 1000);
       }
     }
   };
@@ -87,23 +155,90 @@ const PLUAnalyzer = () => {
           console.log(`✅ ${suggestions.length} suggestions trouvées`);
           
           setAddressSuggestions(suggestions);
-          setShowSuggestions(suggestions.length > 0);
+          setShowAddressSuggestions(suggestions.length > 0);
         } else {
           console.log(`⚠️ Format de réponse inattendu:`, data);
           setAddressSuggestions([]);
-          setShowSuggestions(false);
+          setShowAddressSuggestions(false);
         }
       } else {
         console.error(`❌ Erreur HTTP ${response.status}`);
         setAddressSuggestions([]);
-        setShowSuggestions(false);
+        setShowAddressSuggestions(false);
       }
     } catch (error) {
       console.error('❌ Erreur lors de la recherche de suggestions:', error);
       setAddressSuggestions([]);
-      setShowSuggestions(false);
+      setShowAddressSuggestions(false);
     } finally {
       setLoadingSuggestions(false);
+    }
+  };
+
+  const searchCommuneSuggestions = async (query: string, codePostal?: string) => {
+    if (query.length < 2) return;
+    
+    console.log(`🔍 Recherche communes pour: "${query}"${codePostal ? ` (${codePostal})` : ''}`);
+    setLoadingSuggestions(true);
+    
+    try {
+      const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api';
+      let url = `${API_BASE_URL}/cadastre/suggest/communes?q=${encodeURIComponent(query)}`;
+      
+      if (codePostal && codePostal.length === 5) {
+        url += `&codePostal=${codePostal}`;
+      }
+      
+      const response = await fetch(url);
+      
+      if (response.ok) {
+        const data = await response.json();
+        
+        if (data.success && Array.isArray(data.data)) {
+          const suggestions = data.data as CommuneSuggestion[];
+          console.log(`✅ ${suggestions.length} communes trouvées`);
+          
+          setCommuneSuggestions(suggestions);
+          setShowCommuneSuggestions(suggestions.length > 0);
+        } else {
+          setCommuneSuggestions([]);
+          setShowCommuneSuggestions(false);
+        }
+      }
+    } catch (error) {
+      console.error('❌ Erreur suggestions communes:', error);
+      setCommuneSuggestions([]);
+      setShowCommuneSuggestions(false);
+    } finally {
+      setLoadingSuggestions(false);
+    }
+  };
+
+  const validateParcelleReference = async (codePostal: string, commune: string, numeroParcelle: string) => {
+    console.log(`🔍 Validation parcelle: ${numeroParcelle} à ${commune} (${codePostal})`);
+    setValidatingParcelle(true);
+    
+    try {
+      const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api';
+      const url = `${API_BASE_URL}/cadastre/validate?codePostal=${encodeURIComponent(codePostal)}&commune=${encodeURIComponent(commune)}&numeroParcelle=${encodeURIComponent(numeroParcelle)}`;
+      
+      const response = await fetch(url);
+      
+      if (response.ok) {
+        const data = await response.json();
+        
+        if (data.success) {
+          setValidationResult(data.data);
+          console.log(`${data.data.isValid ? '✅' : '❌'} Validation:`, data.data);
+        }
+      } else {
+        setValidationResult({ isValid: false, errors: ['Erreur de validation'] });
+      }
+    } catch (error) {
+      console.error('❌ Erreur validation:', error);
+      setValidationResult({ isValid: false, errors: ['Erreur de connexion'] });
+    } finally {
+      setValidatingParcelle(false);
     }
   };
 
@@ -115,13 +250,25 @@ const PLUAnalyzer = () => {
       address: suggestion.label
     }));
     setAddressSuggestions([]);
-    setShowSuggestions(false);
+    setShowAddressSuggestions(false);
+  };
+
+  const selectCommuneSuggestion = (suggestion: CommuneSuggestion) => {
+    console.log(`✅ Sélection commune: "${suggestion.nom}"`);
+    
+    setFormData(prev => ({
+      ...prev,
+      commune: suggestion.nom
+    }));
+    setCommuneSuggestions([]);
+    setShowCommuneSuggestions(false);
   };
 
   // Fermer les suggestions quand on clique ailleurs
   useEffect(() => {
     const handleClickOutside = () => {
-      setShowSuggestions(false);
+      setShowAddressSuggestions(false);
+      setShowCommuneSuggestions(false);
     };
 
     document.addEventListener('click', handleClickOutside);
@@ -129,6 +276,9 @@ const PLUAnalyzer = () => {
       document.removeEventListener('click', handleClickOutside);
       if (suggestionTimeoutRef.current) {
         clearTimeout(suggestionTimeoutRef.current);
+      }
+      if (validationTimeoutRef.current) {
+        clearTimeout(validationTimeoutRef.current);
       }
     };
   }, []);
@@ -140,7 +290,8 @@ const PLUAnalyzer = () => {
   const validateCadastreData = (): boolean => {
     return formData.codePostal.length === 5 && 
            formData.commune.length > 2 && 
-           formData.numeroParcelle.length > 0;
+           formData.numeroParcelle.length > 0 &&
+           validationResult?.isValid === true;
   };
 
   const analyzePLU = async () => {
@@ -155,6 +306,9 @@ const PLUAnalyzer = () => {
         }
       } else {
         if (!validateCadastreData()) {
+          if (!validationResult?.isValid) {
+            throw new Error("La référence parcellaire n'est pas valide. Vérifiez les données saisies.");
+          }
           throw new Error("Veuillez remplir tous les champs cadastraux obligatoires.");
         }
       }
@@ -210,7 +364,11 @@ const PLUAnalyzer = () => {
       };
 
       setResult(transformedResult);
+      console.log(`✅ Analyse réussie:`, transformedResult);
+
     } catch (err) {
+      console.error('❌ Erreur analyse:', err);
+      
       if (err instanceof Error) {
         setError(err.message);
       } else {
@@ -218,10 +376,10 @@ const PLUAnalyzer = () => {
       }
       
       // En cas d'erreur, afficher des données de démonstration
-      console.warn('Utilisation des données de démonstration:', err);
+      console.warn('Utilisation des données de démonstration');
       const mockResult: ParcelData = {
         address: searchType === 'address' ? formData.address : `${formData.numeroParcelle}, ${formData.commune} ${formData.codePostal}`,
-        parcelle: searchType === 'address' ? "AB 123" : formData.numeroParcelle,
+        parcelle: searchType === 'address' ? "AB 1234" : formData.numeroParcelle,
         commune: searchType === 'address' ? "Exemple-Ville" : formData.commune,
         zone: "UB - Zone urbaine mixte",
         superficie: 450,
@@ -302,7 +460,7 @@ const PLUAnalyzer = () => {
                     type="text"
                     value={formData.address}
                     onChange={(e) => handleInputChange('address', e.target.value)}
-                    onFocus={() => formData.address.length > 3 && addressSuggestions.length > 0 && setShowSuggestions(true)}
+                    onFocus={() => formData.address.length > 3 && addressSuggestions.length > 0 && setShowAddressSuggestions(true)}
                     onClick={(e) => e.stopPropagation()}
                     placeholder="Ex: 123 Rue de la République 75001 Paris"
                     className="w-full p-4 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
@@ -316,7 +474,7 @@ const PLUAnalyzer = () => {
                   )}
                   
                   {/* Suggestions dropdown */}
-                  {showSuggestions && addressSuggestions.length > 0 && (
+                  {showAddressSuggestions && addressSuggestions.length > 0 && (
                     <div className="absolute z-50 w-full mt-1 bg-gray-700 border border-gray-600 rounded-lg shadow-lg max-h-60 overflow-y-auto">
                       {addressSuggestions.map((suggestion, index) => (
                         <button
@@ -338,7 +496,7 @@ const PLUAnalyzer = () => {
                   )}
                   
                   {/* Message si pas de suggestions */}
-                  {showSuggestions && addressSuggestions.length === 0 && !loadingSuggestions && formData.address.length > 3 && (
+                  {showAddressSuggestions && addressSuggestions.length === 0 && !loadingSuggestions && formData.address.length > 3 && (
                     <div className="absolute z-50 w-full mt-1 bg-gray-700 border border-gray-600 rounded-lg shadow-lg p-3">
                       <div className="text-gray-400 text-sm">
                         Aucune suggestion trouvée. Vérifiez l'orthographe ou saisissez une adresse plus complète.
@@ -349,55 +507,157 @@ const PLUAnalyzer = () => {
                 <p className="text-sm text-gray-500">
                   Saisissez l'adresse complète avec le numéro, la rue, le code postal et la ville
                 </p>
-                
-                {/* Debug info */}
-                {process.env.NODE_ENV === 'development' && (
-                  <div className="text-xs text-gray-500 mt-2">
-                    Debug: {addressSuggestions.length} suggestions • Visible: {showSuggestions ? 'Oui' : 'Non'} • Loading: {loadingSuggestions ? 'Oui' : 'Non'}
-                  </div>
-                )}
               </div>
             )}
 
             {/* Cadastre Search */}
             {searchType === 'cadastre' && (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Code postal
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.codePostal}
-                    onChange={(e) => handleInputChange('codePostal', e.target.value)}
-                    placeholder="75001"
-                    maxLength={5}
-                    className="w-full p-4 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  />
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  {/* Code postal */}
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      Code postal *
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.codePostal}
+                      onChange={(e) => handleInputChange('codePostal', e.target.value)}
+                      placeholder="75001"
+                      maxLength={5}
+                      className="w-full p-4 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    />
+                  </div>
+
+                  {/* Commune */}
+                  <div className="relative">
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      Commune *
+                    </label>
+                    <div className="relative">
+                      <input
+                        type="text"
+                        value={formData.commune}
+                        onChange={(e) => handleInputChange('commune', e.target.value)}
+                        onFocus={() => formData.commune.length > 2 && communeSuggestions.length > 0 && setShowCommuneSuggestions(true)}
+                        onClick={(e) => e.stopPropagation()}
+                        placeholder="Paris"
+                        className="w-full p-4 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      />
+                      
+                      {/* Loading indicator pour suggestions communes */}
+                      {loadingSuggestions && (
+                        <div className="absolute right-3 top-1/2 transform -translate-y-1/2">
+                          <Loader2 className="w-3 h-3 animate-spin text-blue-400" />
+                        </div>
+                      )}
+                      
+                      {/* Suggestions communes dropdown */}
+                      {showCommuneSuggestions && communeSuggestions.length > 0 && (
+                        <div className="absolute z-50 w-full mt-1 bg-gray-700 border border-gray-600 rounded-lg shadow-lg max-h-48 overflow-y-auto">
+                          {communeSuggestions.map((suggestion, index) => (
+                            <button
+                              key={index}
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                selectCommuneSuggestion(suggestion);
+                              }}
+                              className="w-full text-left p-3 hover:bg-gray-600 transition-colors border-b border-gray-600 last:border-b-0 focus:bg-gray-600 focus:outline-none"
+                            >
+                              <div className="text-white font-medium">{suggestion.nom}</div>
+                              <div className="text-gray-400 text-sm">
+                                {suggestion.codesPostaux.join(', ')}
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Numéro de parcelle */}
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">
+                      Numéro de parcelle *
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.numeroParcelle}
+                      onChange={(e) => handleInputChange('numeroParcelle', e.target.value)}
+                      placeholder="AB 1234"
+                      className="w-full p-4 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    />
+                  </div>
                 </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Commune
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.commune}
-                    onChange={(e) => handleInputChange('commune', e.target.value)}
-                    placeholder="Paris"
-                    className="w-full p-4 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">
-                    Numéro de parcelle
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.numeroParcelle}
-                    onChange={(e) => handleInputChange('numeroParcelle', e.target.value)}
-                    placeholder="AB 123"
-                    className="w-full p-4 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  />
+
+                {/* Validation de la parcelle */}
+                {(formData.codePostal.length === 5 && formData.commune.length > 2 && formData.numeroParcelle.length > 0) && (
+                  <div className="mt-4">
+                    {validatingParcelle ? (
+                      <div className="flex items-center space-x-2 text-blue-400">
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span className="text-sm">Validation de la parcelle...</span>
+                      </div>
+                    ) : validationResult ? (
+                      <div className={`flex items-start space-x-3 p-3 rounded-lg ${
+                        validationResult.isValid 
+                          ? 'bg-green-900/50 border border-green-700' 
+                          : 'bg-red-900/50 border border-red-700'
+                      }`}>
+                        {validationResult.isValid ? (
+                          <CheckCircle className="w-5 h-5 text-green-400 flex-shrink-0 mt-0.5" />
+                        ) : (
+                          <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
+                        )}
+                        <div>
+                          {validationResult.isValid ? (
+                            <div>
+                              <p className="text-green-200 font-medium">Parcelle trouvée !</p>
+                              {validationResult.parcelle && (
+                                <div className="text-green-300 text-sm mt-1">
+                                  <p>ID: {validationResult.parcelle.id}</p>
+                                  <p>Commune: {validationResult.parcelle.commune}</p>
+                                  <p>Section: {validationResult.parcelle.section} - Numéro: {validationResult.parcelle.numero}</p>
+                                  <p>Superficie: {validationResult.parcelle.contenance} m²</p>
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <div>
+                              <p className="text-red-200 font-medium">Parcelle non trouvée</p>
+                              {validationResult.errors && validationResult.errors.length > 0 && (
+                                <ul className="text-red-300 text-sm mt-1 list-disc list-inside">
+                                  {validationResult.errors.map((error, index) => (
+                                    <li key={index}>{error}</li>
+                                  ))}
+                                </ul>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+
+                {/* Aide pour le format */}
+                <div className="bg-blue-900/20 border border-blue-700/30 p-4 rounded-lg">
+                  <div className="flex items-start space-x-3">
+                    <Info className="w-5 h-5 text-blue-400 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-blue-200 font-medium mb-2">Format de la référence parcellaire :</p>
+                      <ul className="text-blue-300 text-sm space-y-1">
+                        <li>• <strong>Section</strong> : 1 à 3 lettres (ex: AB, ZE, A)</li>
+                        <li>• <strong>Numéro</strong> : 1 à 4 chiffres (ex: 1234, 42)</li>
+                        <li>• <strong>Formats acceptés</strong> : AB1234, AB 1234, AB-1234</li>
+                        <li>• <strong>Numéros courts</strong> : complétés automatiquement (42 → 0042)</li>
+                      </ul>
+                      <p className="text-blue-300 text-sm mt-2">
+                        💡 La validation se fait automatiquement pendant la saisie
+                      </p>
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
@@ -405,8 +665,8 @@ const PLUAnalyzer = () => {
             {/* Search Button */}
             <button
               onClick={analyzePLU}
-              disabled={loading}
-              className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 disabled:from-gray-600 disabled:to-gray-600 text-white px-8 py-4 rounded-lg font-medium transition-all flex items-center justify-center space-x-2 shadow-lg"
+              disabled={loading || (searchType === 'cadastre' && !validateCadastreData())}
+              className="bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 disabled:from-gray-600 disabled:to-gray-600 text-white px-8 py-4 rounded-lg font-medium transition-all flex items-center justify-center space-x-2 shadow-lg disabled:cursor-not-allowed"
             >
               {loading ? (
                 <Loader2 className="w-5 h-5 animate-spin" />
@@ -415,6 +675,16 @@ const PLUAnalyzer = () => {
               )}
               <span>{loading ? 'Analyse en cours...' : 'Analyser la parcelle'}</span>
             </button>
+
+            {/* État du bouton pour le cadastre */}
+            {searchType === 'cadastre' && !validateCadastreData() && (
+              <p className="text-sm text-gray-400 text-center">
+                {validationResult?.isValid === false 
+                  ? "❌ Référence parcellaire invalide"
+                  : "⏳ Remplissez tous les champs pour valider la parcelle"
+                }
+              </p>
+            )}
           </div>
         </div>
 
@@ -432,7 +702,14 @@ const PLUAnalyzer = () => {
             {/* Success Banner */}
             <div className="bg-green-900/50 border border-green-700 rounded-lg p-4 flex items-center space-x-3">
               <CheckCircle className="w-5 h-5 text-green-400 flex-shrink-0" />
-              <p className="text-green-200">Analyse terminée avec succès</p>
+              <p className="text-green-200">
+                Analyse terminée avec succès
+                {searchType === 'cadastre' && validationResult?.parcelle && (
+                  <span className="ml-2 text-green-300">
+                    (Parcelle {validationResult.parcelle.id})
+                  </span>
+                )}
+              </p>
             </div>
 
             {/* Basic Info */}
@@ -440,7 +717,9 @@ const PLUAnalyzer = () => {
               <h2 className="text-2xl font-bold mb-4 text-blue-400">Informations générales</h2>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <div className="bg-gray-700 p-4 rounded-lg">
-                  <h3 className="font-medium text-gray-300 mb-2">Adresse</h3>
+                  <h3 className="font-medium text-gray-300 mb-2">
+                    {searchType === 'address' ? 'Adresse' : 'Référence'}
+                  </h3>
                   <p className="text-white">{result.address}</p>
                 </div>
                 <div className="bg-gray-700 p-4 rounded-lg">
@@ -453,7 +732,9 @@ const PLUAnalyzer = () => {
                 </div>
                 <div className="bg-gray-700 p-4 rounded-lg">
                   <h3 className="font-medium text-gray-300 mb-2">Superficie</h3>
-                  <p className="text-white">{result.superficie} m²</p>
+                  <p className="text-white">
+                    {result.superficie ? `${result.superficie} m²` : 'Non disponible'}
+                  </p>
                 </div>
               </div>
             </div>
@@ -494,6 +775,18 @@ const PLUAnalyzer = () => {
                 ))}
               </div>
             </div>
+          </div>
+        )}
+
+        {/* Debug info */}
+        {process.env.NODE_ENV === 'development' && (
+          <div className="mt-8 text-xs text-gray-500 bg-gray-800 p-4 rounded">
+            <p>Debug Info:</p>
+            <p>Search Type: {searchType}</p>
+            <p>Form Data: {JSON.stringify(formData, null, 2)}</p>
+            <p>Validation: {JSON.stringify(validationResult, null, 2)}</p>
+            <p>Address Suggestions: {addressSuggestions.length}</p>
+            <p>Commune Suggestions: {communeSuggestions.length}</p>
           </div>
         )}
       </div>
