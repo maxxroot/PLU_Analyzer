@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import { body, validationResult, query } from 'express-validator';
 import { pluApiService } from './services/plu-api.service';
 import dotenv from 'dotenv';
+import * as fs from 'fs/promises';
 
 // Charger les variables d'environnement
 dotenv.config();
@@ -71,26 +72,6 @@ const errorHandler = (err: ApiError, req: Request, res: Response, next: NextFunc
   });
 };
 
-// Middleware de validation
-const validateRequest = (req: Request, res: Response, next: NextFunction) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({
-      success: false,
-      error: {
-        message: 'Données invalides',
-        type: 'VALIDATION_ERROR',
-        details: errors.array(),
-        suggestions: [
-          'Vérifiez le format des données envoyées',
-          'Consultez la documentation des formats acceptés : /api/cadastre/formats'
-        ]
-      }
-    });
-  }
-  next();
-};
-
 /**
  * Middleware de gestion d'erreurs spécifique cadastre
  */
@@ -154,7 +135,581 @@ const cadastreErrorHandler = (err: any, req: Request, res: Response, next: NextF
   next(err);
 };
 
+// Middleware de gestion d'erreurs spécifique aux documents
+const documentErrorHandler = (err: any, req: Request, res: Response, next: NextFunction) => {
+  if (req.path.includes('/documents/')) {
+    const statusCode = err.statusCode || 500;
+    
+    console.error(`Document Error ${statusCode}:`, err);
+    
+    let errorType = 'DOCUMENT_ERROR';
+    let suggestions = [
+      'Vérifiez que le document existe',
+      'Réessayez le téléchargement',
+      'Contactez le support si le problème persiste'
+    ];
+    
+    if (err.message?.includes('not found') || err.message?.includes('non trouvé')) {
+      errorType = 'DOCUMENT_NOT_FOUND';
+      suggestions = [
+        'Le document a peut-être été supprimé du cache',
+        'Relancez l\'analyse pour télécharger à nouveau',
+        'Vérifiez l\'ID du document'
+      ];
+    } else if (err.message?.includes('timeout') || err.message?.includes('fetch')) {
+      errorType = 'DOWNLOAD_ERROR';
+      suggestions = [
+        'Problème de réseau lors du téléchargement',
+        'Réessayez dans quelques minutes',
+        'Vérifiez votre connexion internet'
+      ];
+    }
+    
+    return res.status(statusCode).json({
+      success: false,
+      error: {
+        message: err.message,
+        type: errorType,
+        suggestions,
+        ...(process.env.NODE_ENV === 'development' && { 
+          stack: err.stack,
+          details: err 
+        })
+      },
+      timestamp: new Date().toISOString()
+    });
+  }
+  
+  next(err);
+};
+
+// Middleware de validation
+const validateRequest = (req: Request, res: Response, next: NextFunction) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({
+      success: false,
+      error: {
+        message: 'Données invalides',
+        type: 'VALIDATION_ERROR',
+        details: errors.array(),
+        suggestions: [
+          'Vérifiez le format des données envoyées',
+          'Consultez la documentation des formats acceptés : /api/cadastre/formats'
+        ]
+      }
+    });
+  }
+  next();
+};
+
 // Routes
+
+/**
+ * POST /api/analyze/address-with-docs - Analyse par adresse avec téléchargement documents
+ */
+app.post('/api/analyze/address-with-docs',
+  [
+    body('address')
+      .isString()
+      .isLength({ min: 5, max: 200 })
+      .withMessage('L\'adresse doit contenir entre 5 et 200 caractères')
+      .matches(/\d/)
+      .withMessage('L\'adresse doit contenir au moins un numéro'),
+    body('downloadDocuments')
+      .optional()
+      .isBoolean()
+      .withMessage('downloadDocuments doit être un booléen')
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { address, downloadDocuments = true } = req.body;
+      
+      console.log(`📍 Analyse avec docs pour: ${address} (téléchargement: ${downloadDocuments})`);
+      
+      const startTime = Date.now();
+      
+      const result = await pluApiService.analyzeByAddressWithDownload(address, {
+        downloadDocuments
+      });
+      
+      const duration = Date.now() - startTime;
+      
+      res.json({
+        success: true,
+        data: result,
+        metadata: {
+          processingTime: duration,
+          documentsDownloaded: result.downloadedDocuments?.length || 0,
+          downloadSummary: result.documentDownloadSummary
+        },
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('❌ Erreur analyse avec docs:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/analyze/cadastre-with-docs - Analyse par cadastre avec téléchargement documents
+ */
+app.post('/api/analyze/cadastre-with-docs',
+  [
+    body('codePostal')
+      .isLength({ min: 5, max: 5 })
+      .isNumeric()
+      .withMessage('Code postal français invalide (5 chiffres)'),
+    body('commune')
+      .isString()
+      .isLength({ min: 2, max: 100 })
+      .withMessage('Nom de commune invalide'),
+    body('numeroParcelle')
+      .isString()
+      .isLength({ min: 1, max: 20 })
+      .withMessage('Numéro de parcelle invalide'),
+    body('downloadDocuments')
+      .optional()
+      .isBoolean()
+      .withMessage('downloadDocuments doit être un booléen')
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { codePostal, commune, numeroParcelle, downloadDocuments = true } = req.body;
+      
+      console.log(`🗺️ Analyse cadastrale avec docs:`);
+      console.log(`   Parcelle: ${numeroParcelle} à ${commune} (${codePostal})`);
+      console.log(`   Téléchargement: ${downloadDocuments}`);
+      
+      const startTime = Date.now();
+      
+      const result = await pluApiService.analyzeByCadastreWithDownload(
+        codePostal, 
+        commune, 
+        numeroParcelle, 
+        { downloadDocuments }
+      );
+      
+      const duration = Date.now() - startTime;
+      
+      res.json({
+        success: true,
+        data: result,
+        metadata: {
+          processingTime: duration,
+          documentsDownloaded: result.downloadedDocuments?.length || 0,
+          downloadSummary: result.documentDownloadSummary
+        },
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('❌ Erreur analyse cadastrale avec docs:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/documents/download/:documentId - Télécharger un document PDF
+ */
+app.get('/api/documents/download/:documentId',
+  [
+    param('documentId')
+      .isString()
+      .isLength({ min: 1, max: 100 })
+      .matches(/^[a-zA-Z0-9]+$/)
+      .withMessage('ID de document invalide')
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { documentId } = req.params;
+      
+      console.log(`📥 Demande de téléchargement: ${documentId}`);
+      
+      const document = await pluApiService.getDocument(documentId);
+      
+      if (!document.found || !document.path) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            message: 'Document non trouvé',
+            documentId
+          }
+        });
+      }
+      
+      // Vérifier que le fichier existe
+      try {
+        await fs.access(document.path);
+      } catch (error) {
+        console.error(`❌ Fichier introuvable: ${document.path}`);
+        return res.status(404).json({
+          success: false,
+          error: {
+            message: 'Fichier non disponible',
+            documentId
+          }
+        });
+      }
+      
+      // Obtenir les informations du fichier
+      const stats = await fs.stat(document.path);
+      const filename = `document_plu_${documentId}.pdf`;
+      
+      console.log(`📤 Envoi du fichier: ${document.path} (${Math.round(stats.size / 1024)}KB)`);
+      
+      // Définir les headers pour le téléchargement
+      res.setHeader('Content-Type', document.contentType || 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Content-Length', stats.size.toString());
+      res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache 1h
+      
+      // Envoyer le fichier
+      const fileStream = await fs.readFile(document.path);
+      res.send(fileStream);
+      
+      console.log(`✅ Document envoyé: ${filename}`);
+      
+    } catch (error) {
+      console.error('❌ Erreur téléchargement document:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/documents/preview/:documentId - Prévisualiser un document PDF
+ */
+app.get('/api/documents/preview/:documentId',
+  [
+    param('documentId')
+      .isString()
+      .isLength({ min: 1, max: 100 })
+      .matches(/^[a-zA-Z0-9]+$/)
+      .withMessage('ID de document invalide')
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { documentId } = req.params;
+      
+      console.log(`👁️ Demande de prévisualisation: ${documentId}`);
+      
+      const document = await pluApiService.getDocument(documentId);
+      
+      if (!document.found || !document.path) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            message: 'Document non trouvé',
+            documentId
+          }
+        });
+      }
+      
+      // Vérifier que le fichier existe
+      try {
+        await fs.access(document.path);
+      } catch (error) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            message: 'Fichier non disponible',
+            documentId
+          }
+        });
+      }
+      
+      // Obtenir les informations du fichier
+      const stats = await fs.stat(document.path);
+      
+      console.log(`👁️ Prévisualisation du fichier: ${document.path}`);
+      
+      // Définir les headers pour la prévisualisation
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', 'inline'); // Pour affichage dans le navigateur
+      res.setHeader('Content-Length', stats.size.toString());
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      
+      // Envoyer le fichier pour prévisualisation
+      const fileStream = await fs.readFile(document.path);
+      res.send(fileStream);
+      
+    } catch (error) {
+      console.error('❌ Erreur prévisualisation document:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/documents/cache/stats - Statistiques du cache de documents
+ */
+app.get('/api/documents/cache/stats',
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      console.log(`📊 Demande de statistiques cache`);
+      
+      const stats = await pluApiService.getDocumentCacheStats();
+      
+      res.json({
+        success: true,
+        data: {
+          cache: {
+            totalFiles: stats.totalFiles,
+            totalSize: stats.totalSize,
+            totalSizeFormatted: `${Math.round(stats.totalSize / 1024 / 1024 * 100) / 100} MB`,
+            averageSize: stats.averageSize,
+            averageSizeFormatted: `${Math.round(stats.averageSize / 1024)} KB`,
+            oldestFile: stats.oldestFile,
+            newestFile: stats.newestFile
+          },
+          recommendations: [
+            stats.totalFiles > 100 ? 'Considérer un nettoyage du cache' : 'Taille du cache acceptable',
+            stats.totalSize > 500 * 1024 * 1024 ? 'Cache volumineux (>500MB)' : 'Taille du cache raisonnable'
+          ]
+        },
+        timestamp: new Date().toISOString()
+      });
+      
+    } catch (error) {
+      console.error('❌ Erreur stats cache:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * DELETE /api/documents/cache/clean - Nettoyer le cache de documents
+ */
+app.delete('/api/documents/cache/clean',
+  [
+    query('maxAge')
+      .optional()
+      .isInt({ min: 1, max: 365 })
+      .withMessage('maxAge doit être entre 1 et 365 jours')
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const maxAgeDays = parseInt(req.query.maxAge as string) || 7;
+      const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
+      
+      console.log(`🧹 Nettoyage cache (fichiers > ${maxAgeDays} jours)`);
+      
+      const result = await pluApiService.cleanDocumentCache(maxAgeMs);
+      
+      res.json({
+        success: true,
+        data: {
+          cleaned: result.cleaned,
+          errors: result.errors,
+          maxAgeDays,
+          message: `${result.cleaned} fichier(s) supprimé(s), ${result.errors} erreur(s)`
+        },
+        timestamp: new Date().toISOString()
+      });
+      
+    } catch (error) {
+      console.error('❌ Erreur nettoyage cache:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/documents/info/:documentId - Informations sur un document
+ */
+app.get('/api/documents/info/:documentId',
+  [
+    param('documentId')
+      .isString()
+      .isLength({ min: 1, max: 100 })
+      .matches(/^[a-zA-Z0-9]+$/)
+      .withMessage('ID de document invalide')
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { documentId } = req.params;
+      
+      console.log(`ℹ️ Informations document: ${documentId}`);
+      
+      const document = await pluApiService.getDocument(documentId);
+      
+      if (!document.found || !document.path) {
+        return res.status(404).json({
+          success: false,
+          error: {
+            message: 'Document non trouvé',
+            documentId
+          }
+        });
+      }
+      
+      // Obtenir les informations du fichier
+      const stats = await fs.stat(document.path);
+      
+      res.json({
+        success: true,
+        data: {
+          documentId,
+          found: true,
+          size: stats.size,
+          sizeFormatted: `${Math.round(stats.size / 1024)} KB`,
+          created: stats.birthtime.toISOString(),
+          modified: stats.mtime.toISOString(),
+          contentType: document.contentType,
+          downloadUrl: `/api/documents/download/${documentId}`,
+          previewUrl: `/api/documents/preview/${documentId}`
+        },
+        timestamp: new Date().toISOString()
+      });
+      
+    } catch (error) {
+      console.error('❌ Erreur infos document:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * POST /api/documents/batch-download - Téléchargement de documents en lot
+ */
+app.post('/api/documents/batch-download',
+  [
+    body('documents')
+      .isArray({ min: 1, max: 20 })
+      .withMessage('Liste de documents requis (1-20 éléments)'),
+    body('documents.*.name')
+      .isString()
+      .isLength({ min: 1, max: 200 })
+      .withMessage('Nom de document requis'),
+    body('documents.*.url')
+      .isURL({ protocols: ['http', 'https'] })
+      .withMessage('URL valide requise')
+  ],
+  validateRequest,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { documents } = req.body;
+      
+      console.log(`📚 Téléchargement en lot: ${documents.length} document(s)`);
+      
+      const startTime = Date.now();
+      
+      // Utiliser le service PDF pour télécharger les documents
+      const results = await pluApiService.pdfDocumentService.downloadDocuments(documents);
+      
+      const duration = Date.now() - startTime;
+      
+      // Calculer les statistiques
+      const stats = {
+        total: results.length,
+        successful: results.filter(r => r.success).length,
+        failed: results.filter(r => !r.success).length,
+        cached: results.filter(r => r.cached).length,
+        downloaded: results.filter(r => r.success && !r.cached).length
+      };
+      
+      // Préparer la réponse avec les documents téléchargés
+      const downloadedDocuments = results
+        .filter(r => r.success && r.document)
+        .map(r => r.document!);
+      
+      const errors = results
+        .filter(r => !r.success)
+        .map(r => ({ error: r.error, document: r.document?.name }));
+      
+      res.json({
+        success: true,
+        data: {
+          documents: downloadedDocuments,
+          statistics: stats,
+          errors: errors.length > 0 ? errors : undefined
+        },
+        metadata: {
+          processingTime: duration,
+          batchSize: documents.length
+        },
+        timestamp: new Date().toISOString()
+      });
+      
+    } catch (error) {
+      console.error('❌ Erreur téléchargement en lot:', error);
+      next(error);
+    }
+  }
+);
+
+/**
+ * GET /api/documents/test/download - Test de téléchargement avec URLs d'exemple
+ */
+app.get('/api/documents/test/download',
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      console.log(`🧪 Test de téléchargement de documents`);
+      
+      // URLs de test (à adapter selon vos besoins)
+      const testDocuments = [
+        {
+          name: 'Règlement PLU test',
+          url: 'https://www.example.com/plu-reglement.pdf'
+        },
+        {
+          name: 'Plan de zonage test',
+          url: 'https://www.example.com/plan-zonage.pdf'
+        }
+      ];
+      
+      console.log(`📋 Test avec ${testDocuments.length} document(s) fictifs`);
+      
+      // Simuler un résultat de téléchargement pour la démonstration
+      const mockResults = testDocuments.map((doc, index) => ({
+        success: index === 0, // Premier succès, deuxième échec pour demo
+        document: {
+          id: `test_${index}`,
+          name: doc.name,
+          type: 'reglement' as const,
+          url: `/api/documents/download/test_${index}`,
+          originalUrl: doc.url,
+          size: 1024 * (100 + index * 50), // Tailles fictives
+          downloaded: index === 0,
+          error: index === 0 ? undefined : 'URL de test non accessible'
+        },
+        cached: false,
+        error: index === 0 ? undefined : 'Document de test non disponible'
+      }));
+      
+      const stats = {
+        total: mockResults.length,
+        successful: mockResults.filter(r => r.success).length,
+        failed: mockResults.filter(r => !r.success).length,
+        cached: 0,
+        downloaded: mockResults.filter(r => r.success).length
+      };
+      
+      res.json({
+        success: true,
+        data: {
+          testMode: true,
+          results: mockResults,
+          statistics: stats,
+          message: 'Test de téléchargement - En production, ceci téléchargerait de vrais documents PDF'
+        },
+        timestamp: new Date().toISOString()
+      });
+      
+    } catch (error) {
+      console.error('❌ Erreur test téléchargement:', error);
+      next(error);
+    }
+  }
+);
 
 /**
  * POST /api/analyze/cadastre - Analyse par référence cadastrale (CORRIGÉE)
@@ -1643,6 +2198,8 @@ app.use('*', (req: Request, res: Response) => {
 app.use(errorHandler);
 app.use(pdfErrorHandler);
 app.use(cadastreErrorHandler);
+app.use(documentErrorHandler);
+
 
 
 // Démarrage du serveur
